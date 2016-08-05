@@ -50,7 +50,7 @@ type Wallet struct {
 	// used to generate new addresses for the wallet.
 	unlocked    bool
 	subscribed  bool
-	persist     WalletPersist
+	persist     walletPersist
 	primarySeed modules.Seed
 
 	// The wallet's dependencies. The items 'consensusSetHeight' and
@@ -93,10 +93,9 @@ type Wallet struct {
 	processedTransactionMap          map[types.TransactionID]*modules.ProcessedTransaction
 	unconfirmedProcessedTransactions []modules.ProcessedTransaction
 
-	// TODO: Storing the whole set of historic outputs is expensive and
-	// unnecessary. There's a better way to do it.
-	historicOutputs     map[types.OutputID]types.Currency
-	historicClaimStarts map[types.SiafundOutputID]types.Currency
+	// The wallet's database tracks its seeds, keys, outputs, and
+	// transactions.
+	db *persist.BoltDatabase
 
 	persistDir string
 	log        *persist.Logger
@@ -131,9 +130,6 @@ func New(cs modules.ConsensusSet, tpool modules.TransactionPool, persistDir stri
 
 		processedTransactionMap: make(map[types.TransactionID]*modules.ProcessedTransaction),
 
-		historicOutputs:     make(map[types.OutputID]types.Currency),
-		historicClaimStarts: make(map[types.SiafundOutputID]types.Currency),
-
 		persistDir: persistDir,
 	}
 	err := w.initPersist()
@@ -159,9 +155,6 @@ func (w *Wallet) Close() error {
 			errs = append(errs, err)
 		}
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	w.cs.Unsubscribe(w)
 	w.tpool.Unsubscribe(w)

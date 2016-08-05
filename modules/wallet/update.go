@@ -1,11 +1,14 @@
 package wallet
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/NebulousLabs/Sia/build"
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/types"
+
+	"github.com/NebulousLabs/bolt"
 )
 
 // updateConfirmedSet uses a consensus change to update the confirmed set of
@@ -93,8 +96,8 @@ func (w *Wallet) revertHistory(cc modules.ConsensusChange) {
 
 // applyHistory applies any transaction history that was introduced by the
 // applied blocks.
-func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
-	for _, block := range cc.AppliedBlocks {
+func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
+	for _, block := range applied {
 		w.consensusSetHeight++
 		// Apply the miner payout transaction if applicable.
 		minerPT := modules.ProcessedTransaction{
@@ -116,7 +119,10 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 				RelatedAddress: mp.UnlockHash,
 				Value:          mp.Value,
 			})
-			w.historicOutputs[types.OutputID(block.MinerPayoutID(uint64(i)))] = mp.Value
+			err := dbPutHistoricOutput(tx, types.OutputID(block.MinerPayoutID(uint64(i))), mp.Value)
+			if err != nil {
+				return fmt.Errorf("could not put historic output: %v", err)
+			}
 		}
 		if relevant {
 			w.processedTransactions = append(w.processedTransactions, minerPT)
@@ -130,18 +136,24 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 				ConfirmationHeight:    w.consensusSetHeight,
 				ConfirmationTimestamp: block.Timestamp,
 			}
+
 			for _, sci := range txn.SiacoinInputs {
 				_, exists := w.keys[sci.UnlockConditions.UnlockHash()]
 				if exists {
 					relevant = true
 				}
+				val, err := dbGetHistoricOutput(tx, types.OutputID(sci.ParentID))
+				if err != nil {
+					return fmt.Errorf("could not get historic output: %v", err)
+				}
 				pt.Inputs = append(pt.Inputs, modules.ProcessedInput{
 					FundType:       types.SpecifierSiacoinInput,
 					WalletAddress:  exists,
 					RelatedAddress: sci.UnlockConditions.UnlockHash(),
-					Value:          w.historicOutputs[types.OutputID(sci.ParentID)],
+					Value:          val,
 				})
 			}
+
 			for i, sco := range txn.SiacoinOutputs {
 				_, exists := w.keys[sco.UnlockHash]
 				if exists {
@@ -154,21 +166,32 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 					RelatedAddress: sco.UnlockHash,
 					Value:          sco.Value,
 				})
-				w.historicOutputs[types.OutputID(txn.SiacoinOutputID(uint64(i)))] = sco.Value
+				err := dbPutHistoricOutput(tx, types.OutputID(txn.SiacoinOutputID(uint64(i))), sco.Value)
+				if err != nil {
+					return fmt.Errorf("could not put historic output: %v", err)
+				}
 			}
+
 			for _, sfi := range txn.SiafundInputs {
 				_, exists := w.keys[sfi.UnlockConditions.UnlockHash()]
 				if exists {
 					relevant = true
 				}
-				sfiValue := w.historicOutputs[types.OutputID(sfi.ParentID)]
+				sfiValue, err := dbGetHistoricOutput(tx, types.OutputID(sfi.ParentID))
+				if err != nil {
+					return fmt.Errorf("could not get historic output: %v", err)
+				}
 				pt.Inputs = append(pt.Inputs, modules.ProcessedInput{
 					FundType:       types.SpecifierSiafundInput,
 					WalletAddress:  exists,
 					RelatedAddress: sfi.UnlockConditions.UnlockHash(),
 					Value:          sfiValue,
 				})
-				claimValue := w.siafundPool.Sub(w.historicClaimStarts[sfi.ParentID]).Mul(sfiValue)
+				startVal, err := dbGetHistoricClaimStart(tx, sfi.ParentID)
+				if err != nil {
+					return fmt.Errorf("could not get historic claim start: %v", err)
+				}
+				claimValue := w.siafundPool.Sub(startVal).Mul(sfiValue)
 				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
 					FundType:       types.SpecifierClaimOutput,
 					MaturityHeight: w.consensusSetHeight + types.MaturityDelay,
@@ -177,6 +200,7 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 					Value:          claimValue,
 				})
 			}
+
 			for i, sfo := range txn.SiafundOutputs {
 				_, exists := w.keys[sfo.UnlockHash]
 				if exists {
@@ -189,9 +213,17 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 					RelatedAddress: sfo.UnlockHash,
 					Value:          sfo.Value,
 				})
-				w.historicOutputs[types.OutputID(txn.SiafundOutputID(uint64(i)))] = sfo.Value
-				w.historicClaimStarts[txn.SiafundOutputID(uint64(i))] = sfo.ClaimStart
+				id := txn.SiafundOutputID(uint64(i))
+				err := dbPutHistoricOutput(tx, types.OutputID(id), sfo.Value)
+				if err != nil {
+					return fmt.Errorf("could not put historic output: %v", err)
+				}
+				err = dbPutHistoricClaimStart(tx, id, sfo.ClaimStart)
+				if err != nil {
+					return fmt.Errorf("could not put historic claim start: %v", err)
+				}
 			}
+
 			for _, fee := range txn.MinerFees {
 				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
 					FundType: types.SpecifierMinerFee,
@@ -204,6 +236,8 @@ func (w *Wallet) applyHistory(cc modules.ConsensusChange) {
 			}
 		}
 	}
+
+	return nil
 }
 
 // ProcessConsensusChange parses a consensus change to update the set of
@@ -218,9 +252,14 @@ func (w *Wallet) ProcessConsensusChange(cc modules.ConsensusChange) {
 	defer w.tg.Done()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.updateConfirmedSet(cc)
-	w.revertHistory(cc)
-	w.applyHistory(cc)
+	err := w.db.Update(func(tx *bolt.Tx) error {
+		w.updateConfirmedSet(cc)
+		w.revertHistory(cc)
+		return w.applyHistory(tx, cc.AppliedBlocks)
+	})
+	if err != nil {
+		w.log.Println("ERROR: failed to add consensus change:", err)
+	}
 }
 
 // ReceiveUpdatedUnconfirmedTransactions updates the wallet's unconfirmed
@@ -234,52 +273,64 @@ func (w *Wallet) ReceiveUpdatedUnconfirmedTransactions(txns []types.Transaction,
 	defer w.tg.Done()
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	w.unconfirmedProcessedTransactions = nil
-	for _, txn := range txns {
-		// To save on code complexity, relevancy is determined while building
-		// up the wallet transaction.
-		relevant := false
-		pt := modules.ProcessedTransaction{
-			Transaction:           txn,
-			TransactionID:         txn.ID(),
-			ConfirmationHeight:    types.BlockHeight(math.MaxUint64),
-			ConfirmationTimestamp: types.Timestamp(math.MaxUint64),
-		}
-		for _, sci := range txn.SiacoinInputs {
-			_, exists := w.keys[sci.UnlockConditions.UnlockHash()]
-			if exists {
-				relevant = true
+	err := w.db.Update(func(tx *bolt.Tx) error {
+		w.unconfirmedProcessedTransactions = nil
+		for _, txn := range txns {
+			// To save on code complexity, relevancy is determined while building
+			// up the wallet transaction.
+			relevant := false
+			pt := modules.ProcessedTransaction{
+				Transaction:           txn,
+				TransactionID:         txn.ID(),
+				ConfirmationHeight:    types.BlockHeight(math.MaxUint64),
+				ConfirmationTimestamp: types.Timestamp(math.MaxUint64),
 			}
-			pt.Inputs = append(pt.Inputs, modules.ProcessedInput{
-				FundType:       types.SpecifierSiacoinInput,
-				WalletAddress:  exists,
-				RelatedAddress: sci.UnlockConditions.UnlockHash(),
-				Value:          w.historicOutputs[types.OutputID(sci.ParentID)],
-			})
-		}
-		for i, sco := range txn.SiacoinOutputs {
-			_, exists := w.keys[sco.UnlockHash]
-			if exists {
-				relevant = true
+			for _, sci := range txn.SiacoinInputs {
+				_, exists := w.keys[sci.UnlockConditions.UnlockHash()]
+				if exists {
+					relevant = true
+				}
+				val, err := dbGetHistoricOutput(tx, types.OutputID(sci.ParentID))
+				if err != nil {
+					return fmt.Errorf("could not get historic output: %v", err)
+				}
+				pt.Inputs = append(pt.Inputs, modules.ProcessedInput{
+					FundType:       types.SpecifierSiacoinInput,
+					WalletAddress:  exists,
+					RelatedAddress: sci.UnlockConditions.UnlockHash(),
+					Value:          val,
+				})
 			}
-			pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
-				FundType:       types.SpecifierSiacoinOutput,
-				MaturityHeight: types.BlockHeight(math.MaxUint64),
-				WalletAddress:  exists,
-				RelatedAddress: sco.UnlockHash,
-				Value:          sco.Value,
-			})
-			w.historicOutputs[types.OutputID(txn.SiacoinOutputID(uint64(i)))] = sco.Value
+			for i, sco := range txn.SiacoinOutputs {
+				_, exists := w.keys[sco.UnlockHash]
+				if exists {
+					relevant = true
+				}
+				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
+					FundType:       types.SpecifierSiacoinOutput,
+					MaturityHeight: types.BlockHeight(math.MaxUint64),
+					WalletAddress:  exists,
+					RelatedAddress: sco.UnlockHash,
+					Value:          sco.Value,
+				})
+				err := dbPutHistoricOutput(tx, types.OutputID(txn.SiacoinOutputID(uint64(i))), sco.Value)
+				if err != nil {
+					return fmt.Errorf("could not put historic output: %v", err)
+				}
+			}
+			for _, fee := range txn.MinerFees {
+				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
+					FundType: types.SpecifierMinerFee,
+					Value:    fee,
+				})
+			}
+			if relevant {
+				w.unconfirmedProcessedTransactions = append(w.unconfirmedProcessedTransactions, pt)
+			}
 		}
-		for _, fee := range txn.MinerFees {
-			pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
-				FundType: types.SpecifierMinerFee,
-				Value:    fee,
-			})
-		}
-		if relevant {
-			w.unconfirmedProcessedTransactions = append(w.unconfirmedProcessedTransactions, pt)
-		}
+		return nil
+	})
+	if err != nil {
+		w.log.Println("ERROR: failed to add unconfirmed transactions:", err)
 	}
 }

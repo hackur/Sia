@@ -3,6 +3,7 @@ package wallet
 import (
 	"testing"
 
+	"github.com/NebulousLabs/Sia/modules/miner"
 	"github.com/NebulousLabs/Sia/types"
 )
 
@@ -24,6 +25,7 @@ func TestIntegrationLoad1of1Siag(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+	wt.wallet.Close()
 
 	// Create a second wallet that loads the persist structures of the existing
 	// wallet. This wallet should have a siafund balance.
@@ -46,7 +48,11 @@ func TestIntegrationLoad1of1Siag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = wt.miner.AddBlock()
+	m, err := miner.New(wt.cs, wt.tpool, w, w.persistDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.AddBlock()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +80,7 @@ func TestIntegrationLoad2of3Siag(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+	wt.wallet.Close()
 
 	// Create a second wallet that loads the persist structures of the existing
 	// wallet. This wallet should have a siafund balance.
@@ -96,7 +103,11 @@ func TestIntegrationLoad2of3Siag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = wt.miner.AddBlock()
+	m, err := miner.New(wt.cs, wt.tpool, w, w.persistDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.AddBlock()
 	if err != nil {
 		t.Fatal(err)
 	}

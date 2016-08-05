@@ -92,7 +92,7 @@ func TestIntegrationPreEncryption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wt.closeWt()
+
 	// Check that the wallet knows it's not encrypted.
 	if wt.wallet.Encrypted() {
 		t.Error("wallet is reporting that it has been encrypted")
@@ -105,6 +105,7 @@ func TestIntegrationPreEncryption(t *testing.T) {
 	if err != errUnencryptedWallet {
 		t.Fatal(err)
 	}
+	wt.closeWt()
 
 	// Create a second wallet using the same directory - make sure that if any
 	// files have been created, the wallet is still being treated as new.
@@ -118,7 +119,7 @@ func TestIntegrationPreEncryption(t *testing.T) {
 	if w1.Unlocked() {
 		t.Error("new wallet is not being treated as locked")
 	}
-
+	w1.Close()
 }
 
 // TestIntegrationUserSuppliedEncryption probes the encryption process when the
